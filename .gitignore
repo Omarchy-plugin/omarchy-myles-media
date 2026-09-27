@@ -1,0 +1,13 @@
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+
+# Legacy per-plugin state, read once for migration into
+# ~/.local/state/omarchy/media/ and then written there instead.
+# These only ever appear if the plugin ran from an old location.
+pinned-hubs.json
+search-history.json
+
+# OS noise
+.DS_Store
+Thumbs.db
