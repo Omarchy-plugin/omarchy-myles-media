@@ -29,6 +29,11 @@ Item {
   property string castStatus: ""
   property bool videoBackendActive: false
   property bool videoPipDismissed: false
+  // Timestamp of the last explicit "pop it out" request. The show path runs
+  // video-ctl.sh detached, so for a moment after asking, the PiP is legitimately
+  // still parked. The enforce tick must not read that gap as a fresh dismissal.
+  property double videoPipShowAt: 0
+  readonly property int videoPipShowGraceMs: 6000
   property bool videoFullscreen: false
   property bool videoClickThrough: false
   property real videoOpacity: 1.0
@@ -3785,11 +3790,16 @@ Item {
       if (g.clickThrough !== undefined) videoClickThrough = !!g.clickThrough
       if (g.aspectLock !== undefined) videoAspectLock = !!g.aspectLock
       if (g.lastPreset) videoPreset = String(g.lastPreset)
+      // The dismissed flag lives on disk in video-pip.json. Adopt it so a shell
+      // reload does not resurrect a PiP the user put away.
+      if (g.hidden !== undefined) videoPipDismissed = !!g.hidden
     }
     if (snap && snap.aspectLock !== undefined) videoAspectLock = !!snap.aspectLock
     if (snap && snap.clickThrough !== undefined) videoClickThrough = !!snap.clickThrough
-    if (snap && snap.online && !videoPipDismissed)
-      videoBackendActive = true
+    // A live mpv means the video backend is active. Whether the PiP is *shown*
+    // is a separate concern owned by videoPipDismissed, so don't gate this on
+    // it — otherwise a dismissed PiP never registers as the active backend.
+    if (snap && snap.online) videoBackendActive = true
     if (videoEnded) {
       var atVideoQueueEnd = Number(snap.playlistPos) >= Number(snap.playlistCount) - 1
       if (atVideoQueueEnd && handoffToAudioQueue()) {}
@@ -4029,6 +4039,8 @@ Item {
       return false
     }
     videoPipDismissed = false
+    // Mark the pop-out as in flight so the enforce tick waits for the async show.
+    videoPipShowAt = Date.now()
     videoBackendActive = true
     // mpv alive with this path — just bring the window back on-screen.
     var livePath = String((mpv && mpv.path) || "")
@@ -4092,8 +4104,40 @@ Item {
       return false
     }
     videoFullscreen = !!enabled
+    // video-ctl brings a dismissed/off-screen PiP back for fullscreen, so this
+    // counts as an explicit pop-out — keep the QML flag in step with it.
+    if (enabled) {
+      videoPipDismissed = false
+      videoPipShowAt = Date.now()
+    }
     runVideoCtl(["fullscreen", JSON.stringify({ enabled: videoFullscreen })], true)
     return true
+  }
+
+  // True while an explicit pop-out is still in flight (async show).
+  function videoPipShowPending() {
+    return videoPipShowAt > 0 && (Date.now() - videoPipShowAt) < videoPipShowGraceMs
+  }
+
+  // Reconcile the dismissed flag with the compositor. Hyprland re-manages
+  // pinned windows on workspace changes, so a dismissed PiP needs a slow
+  // heartbeat to stay dismissed; the same tick adopts a PiP the user minimized
+  // or dragged off screen. video-ctl.sh owns the real hide/show work.
+  function enforceVideoPipVisibility(data) {
+    if (!data) return
+    // A pop-out was just requested — let it land before judging the window.
+    if (root.videoPipShowPending()) return
+    if (data.state && data.state.present) {
+      // Surface reality wins: off screen (or minimized) means dismissed.
+      if (!data.state.onScreen) {
+        if (!videoPipDismissed) videoPipDismissed = true
+      } else if (data.hidden === false) {
+        if (videoPipDismissed) videoPipDismissed = false
+      }
+    } else if (data.hidden === true) {
+      // No window yet, but the intent is "hidden" — do not claim it is up.
+      if (!videoPipDismissed) videoPipDismissed = true
+    }
   }
 
   function toggleVideoFullscreen() {
@@ -5266,6 +5310,33 @@ Item {
     }
   }
 
+  // Slow heartbeat that keeps the PiP's on-screen state matching the user's
+  // intent. Runs through its own Process so it never races the 400ms mpv poll.
+  Process {
+    id: videoEnforceProc
+    command: [root.pluginScript("video-ctl.sh"), "enforce", "{}"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { root.enforceVideoPipVisibility(JSON.parse(String(text || "{}"))) }
+        catch (e) {}
+      }
+    }
+  }
+
+  Timer {
+    id: videoEnforceTimer
+    interval: 2000
+    repeat: true
+    // Not gated on usingMpv: a *dismissed* PiP is exactly the case that still
+    // needs the heartbeat, and usingMpv drops out when the PiP is put away.
+    running: !!(mpv && mpv.online) || videoBackendActive || canShowVideoPip
+    onTriggered: {
+      if (!videoEnforceProc.running && !root.videoPipShowPending())
+        videoEnforceProc.running = true
+    }
+  }
+
   Process {
     id: ffprobeProc
     stdout: StdioCollector {
@@ -6068,7 +6139,7 @@ Item {
       eqPreset: root.eqPreset,
       volumeMode: root.volumeMode,
       extrasTab: root.extrasTabSetting,
-      pluginVersion: "1.11.0",
+      pluginVersion: "1.12.0",
       canQueueCurrent: !!root.canQueueCurrent,
       queueTotal: root.queueTotal,
       queueIndex: root.queueIndex,

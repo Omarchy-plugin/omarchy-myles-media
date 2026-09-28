@@ -44,6 +44,11 @@ DEFAULT_W, DEFAULT_H = 320, 180
 MARGIN = 24
 MIN_W, MIN_H = 240, 135
 
+# Off-screen parking spot used to hide the PiP without killing mpv.
+PARK_X, PARK_Y = -4000, -4000
+# Treat anything up to this far into the negative quadrant as "parked".
+OFFSCREEN_SLACK = 200
+
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v", ".mpeg", ".mpg", ".ts", ".flv"}
 
 
@@ -136,6 +141,13 @@ def ensure_mpv(path="", title=""):
     except Exception:
       pass
   geom = geometry_string()
+  # A dismissed PiP must not flash back on screen when mpv respawns.
+  spawn_parked = bool(load_geom().get("hidden"))
+  if spawn_parked:
+    g = load_geom()
+    w = int(g.get("width") or DEFAULT_W)
+    h = int(g.get("height") or DEFAULT_H)
+    geom = f"{w}x{h}{PARK_X:+d}{PARK_Y:+d}"
   cmd = [
     "mpv",
     "--force-window=immediate",
@@ -179,9 +191,31 @@ def ensure_mpv(path="", title=""):
     f.write(str(proc.pid))
   for _ in range(40):
     if mpv_alive():
+      if spawn_parked:
+        park_spawned_window()
       return True
     time.sleep(0.05)
   return mpv_alive()
+
+
+def park_spawned_window():
+  """Park a freshly spawned PiP.
+
+  `--geometry` alone is not enough: the Hyprland rule re-pins the window and can
+  re-place it on map, so wait for the surface to exist and then force the parked
+  state. Mirrors apply_float_pin()'s bounded wait for the address.
+  """
+  for _ in range(60):
+    if hypr_address():
+      break
+    time.sleep(0.05)
+  for _ in range(10):
+    hide_window()
+    st = pip_window_state()
+    if st["present"] and not st["onScreen"] and not st["pinned"]:
+      return True
+    time.sleep(0.05)
+  return False
 
 
 def stop_mpv():
@@ -286,6 +320,25 @@ def hypr_pin():
   return hypr_lua("hl.dsp.window.pin()")
 
 
+def hypr_unpin(addr=None):
+  """Unpin by address so the current focus is left alone."""
+  addr = addr or hypr_address()
+  if not addr:
+    return False
+  target = json.dumps(f"address:{addr}")
+  return hypr_lua(f"hl.dsp.window.pin({{ action = 'off', window = {target} }})")
+
+
+def hypr_repin():
+  """Re-assert float + pin by address (used when bringing the PiP back)."""
+  addr = hypr_address()
+  if not addr:
+    return False
+  target = json.dumps(f"address:{addr}")
+  hypr_lua(f"hl.dsp.window.float({{ action = 'on', window = {target} }})")
+  return hypr_lua(f"hl.dsp.window.pin({{ action = 'on', window = {target} }})")
+
+
 def hypr_fullscreen(enable):
   c = hypr_client()
   addr = str((c or {}).get("address") or "")
@@ -387,6 +440,11 @@ def apply_preset(name):
     name = "S"
   w, h = presets[name]
   prev = load_geom()
+  if prev.get("hidden"):
+    # A dismissed PiP stays dismissed: record the new size/preset but never
+    # place the window back on screen.
+    save_geom({"width": w, "height": h, "lastPreset": name, "fullscreen": False})
+    return {"ok": True, "preset": name, "width": w, "height": h, "hidden": True}
   keep_pos = ("x" in prev and "y" in prev and not prev.get("hidden")
               and int(prev.get("x", -9999)) > -2000)
   save_geom({"width": w, "height": h, "lastPreset": name, "fullscreen": False})
@@ -428,6 +486,9 @@ def snap_corner(corner):
   addr = hypr_address()
   if not addr:
     return {"ok": False, "error": "no-window"}
+  if load_geom().get("hidden"):
+    # Dismissed PiP: remember the corner choice without putting it on screen.
+    return {"ok": True, "corner": corner, "hidden": True}
   try:
     mon = json.loads(subprocess.run(
       ["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=2
@@ -452,6 +513,16 @@ def snap_corner(corner):
     return {"ok": False, "error": str(e)[:160]}
 
 
+def stored_opacity():
+  """Live opacity the PiP should have when it is on screen."""
+  g = load_geom()
+  base = float(g.get("opacity") or 1.0)
+  # Click-through dims the surface as a soft "pass mode" cue.
+  if bool(g.get("clickThrough")):
+    base = max(0.4, min(0.7, base * 0.85))
+  return base
+
+
 def set_opacity(value):
   try:
     v = float(value)
@@ -461,6 +532,15 @@ def set_opacity(value):
   save_geom({"opacity": v})
   hypr_setprop("opacity", v)
   return {"ok": True, "opacity": v}
+
+
+def set_live_opacity(value):
+  """Set the compositor opacity only — never the stored preference."""
+  try:
+    v = float(value)
+  except Exception:
+    v = 1.0
+  return hypr_setprop("opacity", v)
 
 
 def set_clickthrough(enabled):
@@ -477,11 +557,7 @@ def set_clickthrough(enabled):
   except Exception:
     pass
   # Soft visual cue when pass mode is on
-  if enabled:
-    base = float(load_geom().get("opacity") or 1.0)
-    hypr_setprop("opacity", max(0.4, min(0.7, base * 0.85)))
-  else:
-    hypr_setprop("opacity", float(load_geom().get("opacity") or 1.0))
+  set_live_opacity(stored_opacity() if enabled else float(load_geom().get("opacity") or 1.0))
   return {"ok": True, "clickThrough": enabled}
 
 
@@ -515,7 +591,14 @@ def capture_geom_meta():
 
 
 def hide_window():
-  """Park PiP off-screen while keeping mpv (and last frame) alive."""
+  """Take the PiP off screen while keeping mpv (and the last frame) alive.
+
+  Parking off-screen alone is not enough: Hyprland re-manages *pinned* windows
+  whenever the active workspace changes and clamps them back to a visible spot,
+  which is what made a dismissed PiP reappear on the next window switch. So the
+  window is also unpinned and its live opacity is zeroed (the stored opacity
+  preference is untouched and restored by show_window).
+  """
   c = hypr_client()
   if c:
     at = c.get("at") or [0, 0]
@@ -529,13 +612,22 @@ def hide_window():
       })
     else:
       save_geom({"hidden": True})
-  hypr_move(-4000, -4000)
+  else:
+    save_geom({"hidden": True})
+  # Order matters: drop the pin first, otherwise the compositor may re-place the
+  # window the moment it is moved.
+  hypr_unpin()
+  set_live_opacity(0)
+  hypr_move(PARK_X, PARK_Y)
   return {"ok": True, "hidden": True}
 
 
 def show_window():
   save_geom({"hidden": False})
   g = load_geom()
+  # Restore the surface before placing it so it is never briefly invisible.
+  set_live_opacity(stored_opacity())
+  hypr_repin()
   if "x" in g and "y" in g and int(g.get("x", -9999)) > -2000:
     hypr_move(int(g["x"]), int(g["y"]))
     if g.get("width") and g.get("height"):
@@ -543,6 +635,61 @@ def show_window():
   else:
     apply_preset(g.get("lastPreset") or "S")
   return status_payload()
+
+
+def pip_window_state():
+  """Live compositor view of the PiP surface."""
+  c = hypr_client()
+  if not c:
+    return {"present": False, "onScreen": False, "pinned": False, "minimized": False}
+  at = c.get("at") or [0, 0]
+  size = c.get("size") or [DEFAULT_W, DEFAULT_H]
+  x, y = int(at[0]), int(at[1])
+  ws = str((c.get("workspace") or {}).get("name") or "")
+  minimized = ws.startswith("special:minimized")
+  parked = x <= PARK_X + OFFSCREEN_SLACK and y <= PARK_Y + OFFSCREEN_SLACK
+  return {
+    "present": True,
+    "onScreen": (not minimized) and (not parked),
+    "pinned": bool(c.get("pinned")),
+    "minimized": minimized,
+    "floating": bool(c.get("floating")),
+    "x": x, "y": y,
+    "width": int(size[0]), "height": int(size[1]),
+  }
+
+
+def enforce_visibility():
+  """Make the live window agree with the persisted `hidden` flag. Idempotent.
+
+  Runs on a slow tick from the shell so a dismissed PiP stays dismissed no
+  matter what Hyprland does, and so a PiP the user minimized or dragged off
+  screen is *adopted* as dismissed rather than silently restored.
+  """
+  g = load_geom()
+  hidden = bool(g.get("hidden"))
+  st = pip_window_state()
+  if not st["present"]:
+    # No surface right now. If the intent is "hidden", make sure a later respawn
+    # does not surface on screen (ensure_mpv reads the same flag).
+    return {"ok": True, "hidden": hidden, "present": False, "changed": False}
+  changed = False
+  if hidden:
+    if st["onScreen"] or st["pinned"]:
+      hide_window()
+      changed = True
+  elif not st["onScreen"]:
+    # Window is off screen / minimized but the shell thinks it is up: treat the
+    # window as the source of truth and stay dismissed until explicitly re-shown.
+    hide_window()
+    changed = True
+  return {
+    "ok": True,
+    "hidden": bool(load_geom().get("hidden")),
+    "present": True,
+    "changed": changed,
+    "state": pip_window_state(),
+  }
 
 
 def status_payload():
@@ -685,6 +832,9 @@ elif op == "stop":
 
 elif op == "hide":
   print(json.dumps(hide_window()))
+
+elif op == "enforce":
+  print(json.dumps(enforce_visibility()))
 
 elif op == "show":
   ensure_mpv()
