@@ -14,7 +14,7 @@ and heavily extended.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/Mylesoft/omarchy-myles-media.git --enable --yes
+omarchy plugin add https://github.com/Omarchy-plugin/omarchy-myles-media.git --enable --yes
 ```
 
 That clones, validates, installs to `~/.config/omarchy/plugins/myles.media/`, and puts the
@@ -135,7 +135,7 @@ Move the library between machines with the built-in export/import in the panel, 
 For a small behavioural change, edit and move on. For a large one, fork this repo.
 
 ```bash
-git clone https://github.com/Mylesoft/omarchy-myles-media.git
+git clone https://github.com/Omarchy-plugin/omarchy-myles-media.git
 omarchy plugin add /path/to/omarchy-myles-media --enable --yes
 ```
 
