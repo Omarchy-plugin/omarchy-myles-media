@@ -3,7 +3,7 @@
   "id": "myles.media",
   "name": "Media",
   "version": "1.11.0",
-  "author": "Myles",
+  "author": "Mylesoft",
   "description": "Media hubs, video PiP, pasted URL playback, video or MP3 downloads, and casting",
   "kinds": [
     "service",
