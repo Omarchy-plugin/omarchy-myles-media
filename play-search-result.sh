@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Serialize queue replacement across panel and external callers.
+lock_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+exec 9>"$lock_dir/myles-media-play-search-result.lock"
+flock -x 9
 # Argv JSON hit (preferred) or stdin JSON from search results.
 # All sources play in-drawer via cliamp — never launch external apps.
 if [[ $# -ge 1 && -n ${1:-} ]]; then
@@ -8,7 +12,7 @@ else
   raw="$(cat)"
 fi
 python3 - <<'PY' "$raw"
-import json, sys, subprocess, re, shutil
+import json, sys, subprocess, re, shutil, atexit
 
 hit = json.loads(sys.argv[1])
 prov = str(hit.get("provider") or "")
@@ -74,18 +78,85 @@ def job_err(d):
   return str(d.get("error") or job.get("error") or (job.get("result") or {}).get("error") or "")[:240]
 
 
-def begin_fresh_play():
-  """Drop cliamp's live playlist before starting a new track.
+fresh_queue_all = []
+fresh_queue_next = []
+fresh_play_active = False
+fresh_play_succeeded = False
 
-  url.load and track.play both *append* to the live playlist; neither replaces
-  what is already loaded. Without this clear, every play stacks another copy of
-  the track on the live playlist and nothing ever prunes it, so the panel queue
-  fills with duplicates and any stall, retry or skip lands on a stale copy that
-  starts at 0 — the song appears to restart instead of continuing. Queued
-  (play-next) items deliberately keep the playlist, so the queue paths never
-  call this.
-  """
-  call("queue.clear", {}, wait=True, timeout=30)
+
+def job_result(d):
+  return (d.get("job") or {}).get("result") or {}
+
+
+def begin_fresh_play(disable_repeat=False):
+  """Replace the current track while preserving any pending queue."""
+  global fresh_queue_all, fresh_queue_next, fresh_play_active
+  if fresh_play_active:
+    return
+
+  # Snapshot queue and revision before mutating. If either read fails, keep the
+  # existing queue untouched; if it changes during the read, the CAS rejects it.
+  try:
+    proc = subprocess.run(["cliamp", "remote", "state"], capture_output=True,
+                          text=True, timeout=15)
+    data = json.loads(proc.stdout or "{}")
+    snapshot = data.get("snapshot") or {}
+    if proc.returncode != 0 or not snapshot:
+      raise RuntimeError((proc.stderr or "empty runtime snapshot")[:200])
+  except Exception as e:
+    print(json.dumps({"ok": False, "error": "cannot-read-playlist-revision: " + str(e)[:200]}))
+    raise SystemExit(2)
+
+  q = call("queue.list", {"offset": 0, "limit": 1000}, wait=True, timeout=30)
+  if not job_ok(q):
+    print(json.dumps({"ok": False, "error": "cannot-read-queue-before-play: " + job_err(q)}))
+    raise SystemExit(2)
+  qr = job_result(q)
+  tracks = qr.get("tracks") or []
+  total = int(qr.get("total") or len(tracks))
+  if len(tracks) < total:
+    print(json.dumps({"ok": False, "error": "queue-too-large-to-preserve"}))
+    raise SystemExit(2)
+  index = int(qr.get("index") or 0)
+  fresh_queue_all = tracks
+  fresh_queue_next = tracks[index + 1:] if tracks else []
+
+  revision = snapshot.get("playlist_revision")
+  params = {"if_revision": int(revision)} if revision is not None else {}
+  d = call("queue.clear", params, wait=True, timeout=30)
+  if not job_ok(d):
+    print(json.dumps({"ok": False, "error": "cannot-clear-previous-playlist: " + job_err(d)}))
+    raise SystemExit(2)
+
+  fresh_play_active = True
+  atexit.register(restore_fresh_queue)
+  if disable_repeat:
+    d = call("repeat", {"name": "off"}, wait=True, timeout=20)
+    if not job_ok(d):
+      print(json.dumps({"ok": False, "error": "cannot-disable-repeat: " + job_err(d)}))
+      raise SystemExit(2)
+
+
+def restore_fresh_queue():
+  """Restore pending entries after success, or the old queue after failure."""
+  if not fresh_play_active:
+    return
+  tracks = fresh_queue_next if fresh_play_succeeded else fresh_queue_all
+  failures = []
+  for item in tracks:
+    if not isinstance(item, dict):
+      failures.append("invalid queue item")
+      continue
+    if item.get("provider") or item.get("provider_meta") or item.get("providerMeta"):
+      d = call("track.queue", {"track": item}, wait=True, timeout=60)
+    elif item.get("path"):
+      d = call("queue", {"path": item["path"]}, wait=True, timeout=60)
+    else:
+      d = call("track.queue", {"track": item}, wait=True, timeout=60)
+    if not job_ok(d) and d.get("ok") is not True:
+      failures.append(str(item.get("title") or item.get("path") or "track"))
+  if failures:
+    print("media: failed to restore queued tracks: " + ", ".join(failures), file=sys.stderr)
 
 
 def play_url(url, provider, label, mode, wait_load=True):
@@ -103,12 +174,14 @@ def play_url(url, provider, label, mode, wait_load=True):
     }))
     raise SystemExit(0 if ok else 2)
 
-  begin_fresh_play()
+  begin_fresh_play(disable_repeat=(provider == "spotify"))
 
   d = call("url.load", {"path": url, "play": True}, wait=wait_load, timeout=90)
   ok = job_ok(d) or d.get("ok") is True
   if ok:
     call("play", {}, wait=False)
+    global fresh_play_succeeded
+    fresh_play_succeeded = True
   snap = (d.get("job") or {}).get("snapshot") or {}
   resolved = ((snap.get("track") or {}).get("title") or "")
   out_title = label or resolved or url
@@ -185,6 +258,7 @@ def play_youtube(url, label):
     d = call("url.load", {"path": stream, "play": True}, wait=True, timeout=45)
     if job_ok(d) or d.get("ok") is True:
       call("play", {}, wait=False)
+      fresh_play_succeeded = True
       print(json.dumps({
         "ok": True, "mode": "youtube-ytdlp-audio", "provider": "youtube",
         "title": label or title or watch, "path": watch or url, "error": "",
@@ -198,6 +272,7 @@ def play_youtube(url, label):
     d = call("url.load", {"path": watch, "play": True}, wait=True, timeout=12)
     if job_ok(d) or d.get("ok") is True:
       call("play", {}, wait=False)
+      fresh_play_succeeded = True
       print(json.dumps({
         "ok": True, "mode": "youtube", "provider": "youtube",
         "title": label or watch, "path": watch, "error": "",
@@ -234,10 +309,17 @@ if kind in ("spotify-track", "spotify") or prov == "spotify":
   label = " — ".join([x for x in [artist, title] if x]) or title or "Spotify"
   # Prefer real Spotify provider when configured in cliamp.
   if spotify_configured() and track:
-    begin_fresh_play()
+    if queue_only:
+      d = call("track.queue", {"track": track}, wait=False)
+      ok = job_ok(d) or d.get("ok") is True
+      print(json.dumps({"ok": ok, "mode": "spotify-provider+queue", "provider": "spotify",
+                        "title": label, "error": "" if ok else job_err(d)}))
+      raise SystemExit(0 if ok else 2)
+    begin_fresh_play(disable_repeat=True)
     d = call("track.play", {"track": track}, wait=False)
     if job_ok(d) or d.get("ok") is True:
       call("play", {}, wait=False)
+      fresh_play_succeeded = True
       print(json.dumps({"ok": True, "mode": "spotify-provider", "provider": "spotify", "title": label}))
       raise SystemExit(0)
     # Search Spotify catalog
@@ -247,10 +329,17 @@ if kind in ("spotify-track", "spotify") or prov == "spotify":
       res = (raw.get("job") or {}).get("result") or {}
       tracks = res.get("tracks") or res.get("results") or []
       if tracks and isinstance(tracks[0], dict):
-        begin_fresh_play()
+        if queue_only:
+          d = call("track.queue", {"track": tracks[0]}, wait=False)
+          ok = job_ok(d) or d.get("ok") is True
+          print(json.dumps({"ok": ok, "mode": "spotify-search+queue", "provider": "spotify",
+                            "title": label, "error": "" if ok else job_err(d)}))
+          raise SystemExit(0 if ok else 2)
+        begin_fresh_play(disable_repeat=True)
         d = call("track.play", {"track": tracks[0]}, wait=False)
         if job_ok(d) or d.get("ok") is True:
           call("play", {}, wait=False)
+          fresh_play_succeeded = True
           print(json.dumps({"ok": True, "mode": "spotify-search", "provider": "spotify", "title": label}))
           raise SystemExit(0)
   # Fallback: YouTube audio via ytsearch (in-drawer).
@@ -292,6 +381,7 @@ if (kind == "album" or hit.get("feed") or track.get("feed")) and (album_id or pa
   ok = job_ok(d) or d.get("ok") is True
   if ok:
     call("play", {}, wait=False)
+    fresh_play_succeeded = True
   print(json.dumps({
     "ok": ok,
     "mode": "album",
@@ -315,6 +405,7 @@ if track and not queue_only:
   d = call("track.play", {"track": track}, wait=False)
   if job_ok(d) or d.get("ok") is True:
     call("play", {}, wait=False)
+    fresh_play_succeeded = True
     print(json.dumps({"ok": True, "mode": "track.play", "provider": prov, "title": title}))
     raise SystemExit(0)
 elif track and queue_only:

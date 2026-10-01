@@ -126,6 +126,9 @@ Item {
   property bool cliampEventsActive: false
   // Live cliamp playlist (queue.list)
   property var queueItems: []
+  // Serialize playback script invocations: terminating one while it has
+  // replaced cliamp's queue can leave the player empty or lose queued tracks.
+  property var playSearchPendingPayloads: []
   property var videoQueueItems: []
   property int mpvPlaylistTick: 0
   property var queueOrderItems: []
@@ -2086,6 +2089,26 @@ Item {
     }
   }
 
+  function startPlaySearchProcess(payload) {
+    if (playSearchProc.running) {
+      var pending = (playSearchPendingPayloads || []).slice()
+      pending.push(payload)
+      playSearchPendingPayloads = pending
+      return false
+    }
+    playSearchProc.command = [root.pluginScript("play-search-result.sh"), JSON.stringify(payload)]
+    playSearchProc.running = true
+    return true
+  }
+
+  function startNextPlaySearchProcess() {
+    if (playSearchProc.running || !playSearchPendingPayloads.length) return false
+    var pending = playSearchPendingPayloads.slice()
+    var next = pending.shift()
+    playSearchPendingPayloads = pending
+    return root.startPlaySearchProcess(next)
+  }
+
   function playSearchResult(hit) {
     if (!hit) return false
     sourceActionError = ""
@@ -2211,12 +2234,7 @@ Item {
     videoBackendActive = false
 
     if (!cliamp.online) ensureCliampDaemon()
-    if (playSearchProc.running) playSearchProc.running = false
-    playSearchProc.command = [
-      root.pluginScript("play-search-result.sh"),
-      JSON.stringify(payload)
-    ]
-    playSearchProc.running = true
+    root.startPlaySearchProcess(payload)
     showOsd(payload.title || "Play", "media")
     pushRecent(payload)
     rebuildHubEntries()
@@ -2457,7 +2475,7 @@ Item {
   }
 
   function openDownloadsFolder() {
-    Util.execDetached("xdg-open " + JSON.stringify(downloadsDir))
+    Util.execArgv(["xdg-open", downloadsDir])
     showOsd("Downloads folder", "media")
     return true
   }
@@ -2540,18 +2558,20 @@ Item {
   function removeDownload(item) {
     if (!item || !item.path) return false
     var p = String(item.path)
-    // Confine deletes to ~/Downloads/Media (and its realpath).
+    // Only delete direct children of ~/Downloads/Media. The path remains one
+    // argv value; do not interpolate it into a bash command string.
     var rootDir = String(root.downloadsDir || "")
-    if (!rootDir || p.indexOf(rootDir) !== 0) {
+    var relative = rootDir && p.indexOf(rootDir + "/") === 0 ? p.substring(rootDir.length + 1) : ""
+    if (!relative || relative.indexOf("/") !== -1) {
       showOsd("Refuse delete · outside Media folder", "media")
       return false
     }
-    if (p.indexOf("..") >= 0) {
+    if (relative === "." || relative === "..") {
       showOsd("Refuse delete · bad path", "media")
       return false
     }
-    Util.execDetached("rm -f -- " + JSON.stringify(p))
-    Util.execDetached(root.pluginScript("download-current.sh") + " --remove " + JSON.stringify(p))
+    Util.execArgv(["rm", "-f", "--", p])
+    Util.execArgv([root.pluginScript("download-current.sh"), "--remove", p])
     var next = []
     var list = downloadItems || []
     for (var i = 0; i < list.length; i++) {
@@ -2705,12 +2725,7 @@ Item {
     }
 
     if (!cliamp.online) ensureCliampDaemon()
-    if (playSearchProc.running) playSearchProc.running = false
-    playSearchProc.command = [
-      root.pluginScript("play-search-result.sh"),
-      JSON.stringify(payload)
-    ]
-    playSearchProc.running = true
+    root.startPlaySearchProcess(payload)
     showOsd("Queued · " + (payload.title || "track"), "media")
     Qt.callLater(function() { root.loadQueue() })
     return true
@@ -3168,7 +3183,7 @@ Item {
     var dir = p
     var slash = p.lastIndexOf("/")
     if (slash > 0) dir = p.substring(0, slash)
-    Util.execDetached("xdg-open " + JSON.stringify(dir))
+    Util.execArgv(["xdg-open", dir])
     showOsd("Open folder", "media")
     return true
   }
@@ -3176,7 +3191,7 @@ Item {
   function copyPath(path) {
     var p = String(path || "")
     if (!p) return false
-    Util.execDetached(["bash", "-lc", "printf %s " + JSON.stringify(p) + " | wl-copy || true"].join(" "))
+    Util.execArgv(["wl-copy", p])
     showOsd("Path copied", "media")
     return true
   }
@@ -5567,6 +5582,7 @@ Item {
       if (exitCode !== 0) root.handlePlaybackFailure("Playback failed. Check the source or network.")
       cliampRefreshTimer.interval = 400
       cliampRefreshTimer.restart()
+      Qt.callLater(function() { root.startNextPlaySearchProcess() })
     }
   }
 
