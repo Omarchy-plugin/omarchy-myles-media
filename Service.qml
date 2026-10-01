@@ -6155,7 +6155,7 @@ Item {
       eqPreset: root.eqPreset,
       volumeMode: root.volumeMode,
       extrasTab: root.extrasTabSetting,
-      pluginVersion: "1.12.0",
+      pluginVersion: "1.12.1",
       canQueueCurrent: !!root.canQueueCurrent,
       queueTotal: root.queueTotal,
       queueIndex: root.queueIndex,
