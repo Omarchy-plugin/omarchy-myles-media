@@ -74,6 +74,20 @@ def job_err(d):
   return str(d.get("error") or job.get("error") or (job.get("result") or {}).get("error") or "")[:240]
 
 
+def begin_fresh_play():
+  """Drop cliamp's live playlist before starting a new track.
+
+  url.load and track.play both *append* to the live playlist; neither replaces
+  what is already loaded. Without this clear, every play stacks another copy of
+  the track on the live playlist and nothing ever prunes it, so the panel queue
+  fills with duplicates and any stall, retry or skip lands on a stale copy that
+  starts at 0 — the song appears to restart instead of continuing. Queued
+  (play-next) items deliberately keep the playlist, so the queue paths never
+  call this.
+  """
+  call("queue.clear", {}, wait=True, timeout=30)
+
+
 def play_url(url, provider, label, mode, wait_load=True):
   """Load into cliamp once and ensure transport is playing. No mid-play reload."""
   if queue_only:
@@ -88,6 +102,8 @@ def play_url(url, provider, label, mode, wait_load=True):
       "error": "" if ok else job_err(d),
     }))
     raise SystemExit(0 if ok else 2)
+
+  begin_fresh_play()
 
   d = call("url.load", {"path": url, "play": True}, wait=wait_load, timeout=90)
   ok = job_ok(d) or d.get("ok") is True
@@ -165,6 +181,7 @@ def play_youtube(url, label):
         "error": "" if ok else job_err(d),
       }))
       raise SystemExit(0 if ok else 2)
+    begin_fresh_play()
     d = call("url.load", {"path": stream, "play": True}, wait=True, timeout=45)
     if job_ok(d) or d.get("ok") is True:
       call("play", {}, wait=False)
@@ -177,6 +194,7 @@ def play_youtube(url, label):
 
   # 2) Native watch URL — short timeout so we fail fast into ytsearch.
   if is_youtube_watch(watch):
+    begin_fresh_play()
     d = call("url.load", {"path": watch, "play": True}, wait=True, timeout=12)
     if job_ok(d) or d.get("ok") is True:
       call("play", {}, wait=False)
@@ -216,6 +234,7 @@ if kind in ("spotify-track", "spotify") or prov == "spotify":
   label = " — ".join([x for x in [artist, title] if x]) or title or "Spotify"
   # Prefer real Spotify provider when configured in cliamp.
   if spotify_configured() and track:
+    begin_fresh_play()
     d = call("track.play", {"track": track}, wait=False)
     if job_ok(d) or d.get("ok") is True:
       call("play", {}, wait=False)
@@ -228,6 +247,7 @@ if kind in ("spotify-track", "spotify") or prov == "spotify":
       res = (raw.get("job") or {}).get("result") or {}
       tracks = res.get("tracks") or res.get("results") or []
       if tracks and isinstance(tracks[0], dict):
+        begin_fresh_play()
         d = call("track.play", {"track": tracks[0]}, wait=False)
         if job_ok(d) or d.get("ok") is True:
           call("play", {}, wait=False)
@@ -267,6 +287,7 @@ if (kind == "album" or hit.get("feed") or track.get("feed")) and (album_id or pa
   album = album_id or path
   if str(album).startswith("http://") or str(album).startswith("https://"):
     play_url(album, prov, title or album, "feed-url", wait_load=False)
+  begin_fresh_play()
   d = call("provider.load_album", {"provider": prov, "album": album}, wait=False)
   ok = job_ok(d) or d.get("ok") is True
   if ok:
@@ -290,6 +311,7 @@ if path.startswith("http://") or path.startswith("https://"):
 
 # --- Provider track object (local files, podcasts, …) ----------------------
 if track and not queue_only:
+  begin_fresh_play()
   d = call("track.play", {"track": track}, wait=False)
   if job_ok(d) or d.get("ok") is True:
     call("play", {}, wait=False)
